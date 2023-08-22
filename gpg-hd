@@ -2,7 +2,6 @@
 
 const pgp = require('openpgp')
 const crypto =  require('crypto')
-const secp256k1 = require('secp256k1')
 const { pki, random } = require('node-forge')
 const { generateMnemonic, mnemonicToSeed } = require('bip39')
 const nacl = require('tweetnacl')
@@ -28,8 +27,8 @@ pgp.config.showVersion = false
 pgp.config.showComment = false
 
 async function deriveKeys(mnemonic, path, keyType) {
-  let seed = (await mnemonicToSeed(mnemonic)).toString('hex')
-  const bip32Seed = bip32.fromSeed(Buffer.from(seed, 'hex'))
+  let seed = await mnemonicToSeed(mnemonic)
+  const bip32Seed = bip32.fromSeed(seed)
   const caKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(0).privateKey
   const subSigKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(1).privateKey
   const subEncKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(2).privateKey
@@ -141,7 +140,7 @@ async function subKeyPktGen(keyType, key, usage, dateTime) {
       // secp256k1
       oid = [0x2b, 0x81, 0x04, 0x00, 0x0a]
       oid.write = () => new Uint8Array(Buffer.from('052b8104000a', 'hex'))
-      Q = new Uint8Array(secp256k1.publicKeyCreate(key, false))
+      Q = new Uint8Array(crypto.createECDH('secp256k1').setPrivateKey(key).getPublicKey())
       subKeyPacket.privateParams = { d: new Uint8Array(key) }
     } else {
       // ed25519 and cv25519 keys.
@@ -191,7 +190,7 @@ async function subKeySigPktGen(keyType, caKeyPacket, subkeyPacket, usage, dateTi
   const subKeydataToSign = {}
   subKeydataToSign.key = caKeyPacket
   subKeydataToSign.bind = subkeyPacket
-  const subkeySignaturePacket = new pgp.SignaturePacket()
+  const subkeySignaturePacket = new pgp.SignaturePacket(dateTime)
   subkeySignaturePacket.signatureType = pgp.enums.signature.subkeyBinding
   switch (usage) {
     case 'encryption':
@@ -254,7 +253,7 @@ async function caKeyPktGen(keyType, key, dateTime) {
     if (keyType == 'secp256k1') {
       oid = [0x2b, 0x81, 0x04, 0x00, 0x0a]
       oid.write = () => new Uint8Array(Buffer.from('052b8104000a', 'hex'))
-      Q = new Uint8Array(secp256k1.publicKeyCreate(key, false))
+      Q = new Uint8Array(crypto.createECDH('secp256k1').setPrivateKey(key).getPublicKey())
       keyPacket.algorithm = pgp.enums.publicKey.ecdsa;
       keyPacket.privateParams = { d: new Uint8Array(key) }
     } else {
@@ -277,7 +276,7 @@ async function caKeyPktGen(keyType, key, dateTime) {
 }
 
 async function caKeySigPktGen(keyType, keyPkt, userIdPkt, notations, dateTime) {
-  const signaturePacket = new pgp.SignaturePacket();
+  const signaturePacket = new pgp.SignaturePacket(dateTime);
   signaturePacket.signatureType = pgp.enums.signature.certPositive;
   signaturePacket.publicKeyAlgorithm = keyPkt.algorithm;
   if (keyType == 'rsa') {
@@ -373,8 +372,6 @@ async function keychain_gen(keyType, userId, dateTime, caPrivKey, subSigningPriv
 }
 
 async function main(keyType, userId, dateTime, mnemonic) {
-  //mnemonic = generateMnemonic(128)
-  //console.log(mnemonic) // prints 12 words
   let keySeeds
   switch (keyType) {
     case 'ed25519':
@@ -431,6 +428,10 @@ if (process.argv.length < 3) {
   } else {
     // Default determinisic keychain date is epoch of 1 second.
     date = new Date(1000)
+  }
+  if (!bip39Seed) {
+    bip39Seed = generateMnemonic(128)
+    console.log("\nNo seed given, using randomly generated seed: ", bip39Seed, "\n") // prints 12 words
   }
   main(keyType, userId, date, bip39Seed)
 }
