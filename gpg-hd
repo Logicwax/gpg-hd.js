@@ -1,0 +1,438 @@
+#!/usr/bin/env node
+
+const pgp = require('openpgp')
+const crypto =  require('crypto')
+const secp256k1 = require('secp256k1')
+const { pki, random } = require('node-forge')
+const { generateMnemonic, mnemonicToSeed } = require('bip39')
+const nacl = require('tweetnacl')
+const {BIP32Factory} = require('bip32')
+const ecc = require('tiny-secp256k1')
+const { SHAKE } = require('sha3');
+const assert = require('assert')
+
+const bip32 = BIP32Factory(ecc)
+
+const usage = 'Usage: gpg-hd -k [secp256k1|ed25519|rsa] -u "satoshi@btc.com" [-d "2023-08-21T04:20:00.000Z"] -s "[bip39 mnemonic]"'
+
+// https://github.com/LedgerHQ/openpgp-card-app/blob/master/doc/developper/gpgcard3.0-addon.rst
+// /0x80'GPG'/
+const basePath = '80475047'
+const wallet = '0'
+const walletPath = basePath + '/' + wallet
+const rsakeySize = 4096
+const rsa_workers = 4
+
+pgp.config.rejectCurves = new Set()
+pgp.config.showVersion = false
+pgp.config.showComment = false
+
+async function deriveKeys(mnemonic, path, keyType) {
+  let seed = (await mnemonicToSeed(mnemonic)).toString('hex')
+  const bip32Seed = bip32.fromSeed(Buffer.from(seed, 'hex'))
+  const caKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(0).privateKey
+  const subSigKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(1).privateKey
+  const subEncKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(2).privateKey
+  const subAuthKeyPrivBip32Seed = bip32Seed.derivePath(path).deriveHardened(3).privateKey
+  let sha3XOF
+  let sha256
+  let keySize
+
+  switch (keyType) {
+    case 'rsa':
+      keySize = 2048  //half of 4092 RSA key size
+      break
+    case 'secp256k1':
+      keySize = 32
+      break
+    case 'ed25519':
+      keySize = 32
+      break
+  }
+
+  sha3XOF = new SHAKE(256);
+  sha256 = Buffer.concat([caKeyPrivBip32Seed, Buffer.from('sig '), Buffer.from([1])])
+  const caKeyPriv = sha3XOF.update(crypto.createHash('sha256').update(sha256).digest()).digest({ buffer: Buffer.alloc(keySize), format: 'hex' })
+
+  sha3XOF = new SHAKE(256);
+  sha256 = Buffer.concat([subSigKeyPrivBip32Seed, Buffer.from('sig '), Buffer.from([1])])
+  const subSigKeyPriv = sha3XOF.update(crypto.createHash('sha256').update(sha256).digest()).digest({ buffer: Buffer.alloc(keySize), format: 'hex' })
+
+  sha3XOF = new SHAKE(256);
+  sha256 = Buffer.concat([subEncKeyPrivBip32Seed, Buffer.from('enc '), Buffer.from([1])])
+  const subEncKeyPriv = sha3XOF.update(crypto.createHash('sha256').update(sha256).digest()).digest({ buffer: Buffer.alloc(keySize), format: 'hex' })
+
+  sha3XOF = new SHAKE(256);
+  sha256 = Buffer.concat([subAuthKeyPrivBip32Seed, Buffer.from('aut '), Buffer.from([1])])
+  const subAuthKeyPriv = sha3XOF.update(crypto.createHash('sha256').update(sha256).digest()).digest({ buffer: Buffer.alloc(keySize), format: 'hex' })
+
+  return {
+    caKey: Buffer.from(caKeyPriv, 'hex'),
+    subKeys: {
+      sign: Buffer.from(subSigKeyPriv, 'hex'),
+      enc: Buffer.from(subEncKeyPriv, 'hex'),
+      auth: Buffer.from(subAuthKeyPriv, 'hex')
+    }
+  }
+}
+
+async function genRsaDeterministic(keySize, rsa_workers, keySeeds) {
+    const prng = random.createInstance();
+
+    prng.seedFileSync = () => keySeeds.caKey.toString('hex')
+    const caKey = await pki.rsa.generateKeyPair({ bits: keySize, prng, workers: rsa_workers })
+
+    prng.seedFileSync = () => keySeeds.subKeys.sign.toString('hex')
+    const subSigKey = await pki.rsa.generateKeyPair({ bits: keySize, prng, workers: rsa_workers })
+
+    prng.seedFileSync = () => keySeeds.subKeys.enc.toString('hex')
+    const subEncKey = await pki.rsa.generateKeyPair({ bits: keySize, prng, workers: rsa_workers })
+
+    prng.seedFileSync = () => keySeeds.subKeys.auth.toString('hex')
+    const subAuthKey = await pki.rsa.generateKeyPair({ bits: keySize, prng, workers: rsa_workers })
+
+    return {
+      caKey: caKey,
+      subKeys: {
+        sign: subSigKey,
+        enc: subEncKey,
+        auth: subAuthKey
+      }
+    }
+}
+
+async function subKeyPktGen(keyType, key, usage, dateTime) {
+  // Sub-key (auth key) packet.
+  const subKeyPacket = new pgp.SecretSubkeyPacket(dateTime);
+  if (keyType == 'rsa') {
+    switch (usage) {
+      case 'encryption':
+        subKeyPacket.algorithm = pgp.enums.publicKey.rsaEncrypt
+        break;
+      case 'sign':
+        subKeyPacket.algorithm = pgp.enums.publicKey.rsaSign
+        break;
+      case 'authenticate':
+        subKeyPacket.algorithm = pgp.enums.publicKey.rsaEncryptSign
+        break;
+    }
+    subKeyPacket.publicParams = {
+      n: new Uint8Array(key.publicKey.n.toByteArray()),
+      e: new Uint8Array(key.publicKey.e.toByteArray())
+    }
+    subKeyPacket.privateParams = {
+      d: new Uint8Array(key.privateKey.d.toByteArray()),
+      p: new Uint8Array(key.privateKey.p.toByteArray()),
+      q: new Uint8Array(key.privateKey.q.toByteArray()),
+      u: new Uint8Array(key.privateKey.qInv.toByteArray())
+    }
+    subKeyPacket.s2kUsage = pgp.enums.s2k.simple
+  } else {
+    // curves
+    let oid
+    let Q
+    if (keyType == 'secp256k1') {
+      subKeyPacket.privateParams = { d: new Uint8Array(key) }
+      if (usage == 'encryption') {
+        subKeyPacket.algorithm = pgp.enums.publicKey.ecdh
+      } else {
+        subKeyPacket.algorithm = pgp.enums.publicKey.ecdsa
+      }
+      // secp256k1
+      oid = [0x2b, 0x81, 0x04, 0x00, 0x0a]
+      oid.write = () => new Uint8Array(Buffer.from('052b8104000a', 'hex'))
+      Q = new Uint8Array(secp256k1.publicKeyCreate(key, false))
+      subKeyPacket.privateParams = { d: new Uint8Array(key) }
+    } else {
+      // ed25519 and cv25519 keys.
+      if (usage == 'encryption') {
+        // cv25519 encryption.
+        subKeyPacket.algorithm = pgp.enums.publicKey.ecdh
+        oid = [0x2b, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01]
+        oid.write = () => new Uint8Array(Buffer.from('0A2b060104019755010501', 'hex'))
+        // cv25519 keys get reversed.
+        let privateKey = new Uint8Array(key)
+        privateKey[0] = (privateKey[0] & 127) | 64;
+        privateKey[31] &= 248;
+        const publicKey = nacl.box.keyPair.fromSecretKey(privateKey.slice().reverse()).publicKey
+        Q = new Uint8Array([new Uint8Array([0x40]), ...publicKey])
+        // cv25519 keys use 'd' for encryption keys only
+        subKeyPacket.privateParams = { d: new Uint8Array(privateKey) }
+      } else {
+        // ed25519 signing and auth subkeys.
+        subKeyPacket.algorithm = pgp.enums.publicKey.eddsa
+        oid = [0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01]
+        oid.write = () => new Uint8Array(Buffer.from('092b06010401da470f01', 'hex'))
+        let publicKey = nacl.sign.keyPair.fromSeed(new Uint8Array(key)).publicKey
+        Q = new Uint8Array([new Uint8Array([0x40]), ...publicKey])
+        subKeyPacket.privateParams = { seed: new Uint8Array(key) }
+      }
+    }
+    subKeyPacket.publicParams = {
+      oid: oid,
+      Q: Q,
+    }
+    // append kdfParams for all curves.
+    if (usage == 'encryption') {
+      subKeyPacket.publicParams.kdfParams = {
+        hash: pgp.enums.hash.sha256,
+        cipher: pgp.enums.symmetric.aes128,
+        write: () => new Uint8Array([3, 1, pgp.enums.hash.sha256, pgp.enums.symmetric.aes128]),
+      }
+    }
+  }
+  subKeyPacket.isEncrypted = false
+  await subKeyPacket.computeFingerprintAndKeyID()
+  return subKeyPacket
+}
+
+async function subKeySigPktGen(keyType, caKeyPacket, subkeyPacket, usage, dateTime) {
+  //Sub-key signature packet.
+  const subKeydataToSign = {}
+  subKeydataToSign.key = caKeyPacket
+  subKeydataToSign.bind = subkeyPacket
+  const subkeySignaturePacket = new pgp.SignaturePacket()
+  subkeySignaturePacket.signatureType = pgp.enums.signature.subkeyBinding
+  switch (usage) {
+    case 'encryption':
+      subkeySignaturePacket.keyFlags = [pgp.enums.keyFlags.encryptCommunication | pgp.enums.keyFlags.encryptStorage]
+      break;
+    case 'sign':
+      subkeySignaturePacket.keyFlags = [pgp.enums.keyFlags.signData]
+      break;
+    case 'authenticate':
+      subkeySignaturePacket.keyFlags = [pgp.enums.keyFlags.authentication]
+      break;
+  }
+  if (keyType == 'rsa') {
+    switch (usage) {
+      case 'encryption':
+        subkeySignaturePacket.publicKeyAlgorithm = pgp.enums.publicKey.rsaEncrypt
+        break;
+      case 'sign':
+        subkeySignaturePacket.publicKeyAlgorithm = pgp.enums.publicKey.rsaSign
+        break;
+      case 'authenticate':
+        subkeySignaturePacket.publicKeyAlgorithm = pgp.enums.publicKey.rsaEncryptSign
+        break;
+    }
+    subkeySignaturePacket.hashAlgorithm = pgp.enums.hash.sha512
+  } else {
+    // curves.
+    if (keyType == 'ed25519') {
+      subkeySignaturePacket.publicKeyAlgorithm = pgp.enums.publicKey.eddsa
+    } else {
+      subkeySignaturePacket.publicKeyAlgorithm = pgp.enums.publicKey.ecdsa
+    }
+    subkeySignaturePacket.hashAlgorithm = pgp.enums.hash.sha256
+  }
+
+  // Sign the subkey
+  await subkeySignaturePacket.sign(caKeyPacket, subKeydataToSign, dateTime)
+  return subkeySignaturePacket
+}
+
+async function caKeyPktGen(keyType, key, dateTime) {
+  const keyPacket = new pgp.SecretKeyPacket(dateTime)
+
+  if (keyType == 'rsa') {
+    keyPacket.algorithm = pgp.enums.publicKey.rsaSign;
+    keyPacket.publicParams = {
+      n: new Uint8Array(key.publicKey.n.toByteArray()),
+      e: new Uint8Array(key.publicKey.e.toByteArray())
+    }
+    keyPacket.privateParams = {
+      d: new Uint8Array(key.privateKey.d.toByteArray()),
+      p: new Uint8Array(key.privateKey.p.toByteArray()),
+      q: new Uint8Array(key.privateKey.q.toByteArray()),
+      u: new Uint8Array(key.privateKey.qInv.toByteArray())
+    }
+    keyPacket.s2kUsage = pgp.enums.s2k.simple
+  } else {
+    // ec curves.
+    let oid
+    if (keyType == 'secp256k1') {
+      oid = [0x2b, 0x81, 0x04, 0x00, 0x0a]
+      oid.write = () => new Uint8Array(Buffer.from('052b8104000a', 'hex'))
+      Q = new Uint8Array(secp256k1.publicKeyCreate(key, false))
+      keyPacket.algorithm = pgp.enums.publicKey.ecdsa;
+      keyPacket.privateParams = { d: new Uint8Array(key) }
+    } else {
+      // ed25519 ca key.
+      oid = [0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01]
+      oid.write = () => new Uint8Array(Buffer.from('092b06010401da470f01', 'hex'))
+      const publicKey = nacl.sign.keyPair.fromSeed(new Uint8Array(key)).publicKey
+      Q = new Uint8Array([new Uint8Array([0x40]), ...publicKey])
+      keyPacket.algorithm = pgp.enums.publicKey.eddsa
+      keyPacket.privateParams = { seed: new Uint8Array(key) }
+    }
+    keyPacket.publicParams = {
+      oid: oid,
+      Q: Q
+    }
+  }
+  keyPacket.isEncrypted = false
+  await keyPacket.computeFingerprintAndKeyID()
+  return keyPacket
+}
+
+async function caKeySigPktGen(keyType, keyPkt, userIdPkt, notations, dateTime) {
+  const signaturePacket = new pgp.SignaturePacket();
+  signaturePacket.signatureType = pgp.enums.signature.certPositive;
+  signaturePacket.publicKeyAlgorithm = keyPkt.algorithm;
+  if (keyType == 'rsa') {
+    signaturePacket.hashAlgorithm = pgp.enums.hash.sha512
+  } else {
+    signaturePacket.hashAlgorithm = pgp.enums.hash.sha256
+  }
+
+  signaturePacket.keyFlags = [pgp.enums.keyFlags.certifyKeys];
+  signaturePacket.preferredSymmetricAlgorithms = [
+    pgp.enums.symmetric.aes256,
+    pgp.enums.symmetric.aes128,
+    pgp.enums.symmetric.aes192
+  ]
+  signaturePacket.preferredHashAlgorithms = [pgp.enums.hash.sha256, pgp.enums.hash.sha512]
+  signaturePacket.preferredCompressionAlgorithms = [
+    pgp.enums.compression.uncompressed,
+    pgp.enums.compression.zlib,
+    pgp.enums.compression.zip
+  ]
+  signaturePacket.features = [0];
+  signaturePacket.features[0] |= pgp.enums.features.modificationDetection;
+
+  notations.forEach(({name, value}) => {
+    signaturePacket.rawNotations.push({
+      name: name,
+      value: new Uint8Array(Buffer.from(value)),
+      humanReadable: true,
+      critical: 0,
+    })
+  })
+
+  const dataToSign = {};
+  dataToSign.userID = userIdPkt;
+  dataToSign.key = keyPkt;
+  await signaturePacket.sign(keyPkt, dataToSign, dateTime)
+  return signaturePacket
+}
+
+async function keychain_gen(keyType, userId, dateTime, caPrivKey, subSigningPrivKey, subEncPrivKey, subAuthPrivKey) {
+  // CA key packet.
+  const caKeyPkt = await caKeyPktGen(keyType, caPrivKey, dateTime)
+
+  // Sub-key (encryption key) packet.
+  const subEncKeyPkt = await subKeyPktGen(keyType, subEncPrivKey, 'encryption', dateTime)
+  // Sub-key (auth key) packet.
+  let subAuthKeyPkt
+  if (keyType == 'secp256k1') {
+    // use only ed25519 for auth keys, since ssh doesn't support secp256k1.
+    subAuthKeyPkt = await subKeyPktGen('ed25519', subAuthPrivKey, 'authenticate', dateTime)
+  } else {
+    subAuthKeyPkt = await subKeyPktGen(keyType, subAuthPrivKey, 'authenticate', dateTime)
+  }
+  //Sub-key (Signing key) packet.
+  const subSignKeyPkt = await subKeyPktGen(keyType, subSigningPrivKey, 'sign', dateTime)
+
+  // UserID packet.
+  const userIdPkt = new pgp.UserIDPacket()
+  userIdPkt.userID = userId
+
+  // Encryption Sub-key signature packet.
+  const subkeyEncSigPkt = await subKeySigPktGen(keyType, caKeyPkt, subEncKeyPkt, 'encryption', dateTime)
+  // Authentication Sub-key signature packet.
+  const subAuthKeySigPkt = await subKeySigPktGen(keyType, caKeyPkt, subAuthKeyPkt, 'authenticate', dateTime)
+  // Signing Sub-key signature packet.
+  const subSignKeySigPkt = await subKeySigPktGen(keyType, caKeyPkt, subSignKeyPkt, 'sign', dateTime)
+
+  const notations = [{
+    name: 'Deterministic Keychain',
+    value: 'true',
+  }, {
+    name: 'BIP32 Path Standard',
+    value: 'Ledger',
+  }]
+  // CA Key signature packet.
+  const caKeySigPkt = await caKeySigPktGen(keyType, caKeyPkt, userIdPkt, notations, dateTime)
+
+  // Assemble packets together.
+  const packetlist = new pgp.PacketList();
+  packetlist.push(caKeyPkt)
+  packetlist.push(userIdPkt)
+  packetlist.push(caKeySigPkt)
+  packetlist.push(subSignKeyPkt)
+  packetlist.push(subSignKeySigPkt)
+  packetlist.push(subEncKeyPkt)
+  packetlist.push(subkeyEncSigPkt)
+  packetlist.push(subAuthKeyPkt)
+  packetlist.push(subAuthKeySigPkt)
+
+  const prvKey = new pgp.PrivateKey(packetlist)
+  const pubKey = prvKey  //[.toPublic()]
+  console.log(pubKey.armor().replace(/\r\n/g, '\n'))
+}
+
+async function main(keyType, userId, dateTime, mnemonic) {
+  //mnemonic = generateMnemonic(128)
+  //console.log(mnemonic) // prints 12 words
+  let keySeeds
+  switch (keyType) {
+    case 'ed25519':
+      keySeeds = await deriveKeys(mnemonic, walletPath, 'ed25519')
+      break
+    case 'secp256k1':
+      keySeeds = await deriveKeys(mnemonic, walletPath, 'secp256k1')
+      break
+    case 'rsa':
+      keySeeds = await deriveKeys(mnemonic, walletPath, 'rsa')
+      keySeeds = await genRsaDeterministic(rsakeySize, rsa_workers, keySeeds)
+      break
+    default:
+      keySeeds = await deriveKeys(mnemonic, walletPath, 'ed25519')
+  }
+
+  await keychain_gen(keyType, userId, dateTime, keySeeds.caKey, keySeeds.subKeys.sign, keySeeds.subKeys.enc, keySeeds.subKeys.auth)
+}
+
+if (process.argv.length < 3) {
+  console.error(usage)
+  process.exit(1)
+} else {
+  const args = process.argv.slice(2)
+  let keyType
+  let userId
+  let date
+  let bip39Seed
+  try {
+    while (args.length) {
+      const arg = args.shift()
+      if (arg.slice(0, 2) === '-k') {
+        assert.strictEqual(keyType, undefined, 'please define one keytype')
+        keyType = arg.slice(2) || args.shift()
+      } else if (arg.slice(0, 2) == '-u') {
+        assert.strictEqual(userId, undefined, 'please define one userId')
+        userId = arg.slice(2) || args.shift()
+      } else if (arg.slice(0, 2) == '-d') {
+        assert.strictEqual(date, undefined, 'please define one date')
+        date = arg.slice(2) || args.shift()
+      } else if (arg.slice(0, 2) == '-s') {
+        bip39Seed = arg.slice(2) || args.shift()
+      } else {
+        throw new Error(`unknown option ${arg.slice(0, 2)}`)
+      }
+    }
+  } catch (err) {
+    console.error(usage)
+    console.error(`Error: ${err.message}`)
+    process.exit(1)
+  }
+  if (date) {
+    date = new Date(date)
+  } else {
+    // Default determinisic keychain date is epoch of 1 second.
+    date = new Date(1000)
+  }
+  main(keyType, userId, date, bip39Seed)
+}
+
+
