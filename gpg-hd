@@ -101,7 +101,7 @@ async function genRsaDeterministic(keySize, rsa_workers, keySeeds) {
 }
 
 async function subKeyPktGen(keyType, key, usage, dateTime) {
-  // Sub-key (auth key) packet.
+  // Sub-key packet.
   const subKeyPacket = new pgp.SecretSubkeyPacket(dateTime);
   if (keyType == 'rsa') {
     switch (usage) {
@@ -367,8 +367,8 @@ async function keychain_gen(keyType, userId, dateTime, caPrivKey, subSigningPriv
   packetlist.push(subAuthKeySigPkt)
 
   const prvKey = new pgp.PrivateKey(packetlist)
-  const pubKey = prvKey  //[.toPublic()]
-  console.log(pubKey.armor().replace(/\r\n/g, '\n'))
+  const pubKey = prvKey.toPublic()
+  console.log(prvKey.armor().replace(/\r\n/g, '\n'))
 }
 
 async function main(keyType, userId, dateTime, mnemonic) {
