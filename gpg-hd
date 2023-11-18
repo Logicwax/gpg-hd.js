@@ -316,7 +316,7 @@ async function caKeySigPktGen(keyType, keyPkt, userIdPkt, notations, dateTime) {
   return signaturePacket
 }
 
-async function keychain_gen(keyType, userId, dateTime, caPrivKey, subSigningPrivKey, subEncPrivKey, subAuthPrivKey) {
+async function keyChainGen(keyType, userId, dateTime, caPrivKey, subSigningPrivKey, subEncPrivKey, subAuthPrivKey) {
   // CA key packet.
   const caKeyPkt = await caKeyPktGen(keyType, caPrivKey, dateTime)
 
@@ -388,7 +388,7 @@ async function main(keyType, userId, dateTime, mnemonic) {
       keySeeds = await deriveKeys(mnemonic, walletPath, 'ed25519')
   }
 
-  await keychain_gen(keyType, userId, dateTime, keySeeds.caKey, keySeeds.subKeys.sign, keySeeds.subKeys.enc, keySeeds.subKeys.auth)
+  await keyChainGen(keyType, userId, dateTime, keySeeds.caKey, keySeeds.subKeys.sign, keySeeds.subKeys.enc, keySeeds.subKeys.auth)
 }
 
 if (process.argv.length < 3) {
